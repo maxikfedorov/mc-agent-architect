@@ -18,7 +18,7 @@ process.emit = function (name, data, ...args) {
 const client = new OpenAI(config.ai);
 const bot = mineflayer.createBot(config.minecraft);
 const conversationHistory = [];
-const MAX_HISTORY = 6; 
+const MAX_HISTORY = 1; 
 
 bot.loadPlugin(pathfinder);
 bot.loadPlugin(collectBlock);
