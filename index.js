@@ -1,12 +1,8 @@
-const mineflayer = require('mineflayer');
-const { pathfinder, Movements } = require('mineflayer-pathfinder');
-const collectBlock = require('mineflayer-collectblock').plugin;
-const OpenAI = require('openai');
-
+const { createBot } = require('./src/core/bot');
+const { createAIClient } = require('./src/core/aiClient');
+const { executeTools } = require('./src/core/toolExecutor');
+const { getRole } = require('./src/roles');
 const config = require('./config');
-const tools = require('./src/ai/tools');
-const getSystemPrompt = require('./src/ai/systemPrompt');
-const { handleToolCall } = require('./src/actions/index');
 
 const originalEmit = process.emit;
 process.emit = function (name, data, ...args) {
@@ -15,75 +11,109 @@ process.emit = function (name, data, ...args) {
     return originalEmit.apply(process, [name, data, ...args]);
 };
 
-const client = new OpenAI(config.ai);
-const bot = mineflayer.createBot(config.minecraft);
+const client = createAIClient(config);
 const conversationHistory = [];
-const MAX_HISTORY = 1; 
+const MAX_HISTORY = config.ai.max_history || 5;
+let currentRole = getRole('architect');
+const bot = createBot(config);
 
-bot.loadPlugin(pathfinder);
-bot.loadPlugin(collectBlock);
+bot.loadPlugin(require('mineflayer-collectblock').plugin);
 
 bot.on('spawn', () => {
-    const mcData = require('minecraft-data')(bot.version);
-    bot.pathfinder.setMovements(new Movements(bot, mcData));
-    console.log(`[BOT] ${config.minecraft.username} is online.`);
+    console.log(`[BOT] ${currentRole.config.name} online (${currentRole.config.description})`);
 });
 
 bot.on('chat', async (user, msg) => {
     if (user === bot.username) return;
-    console.log(`[CHAT] ${user}: ${msg}`);
+    
+    if (msg.startsWith('/')) {
+        console.log(`[CHAT] Ignoring command: ${msg}`);
+        return;
+    }
+    
+    const systemPhrases = ['Set', 'game mode', 'Gave', 'Teleported', 'experience', 'Game mode'];
+    if (systemPhrases.some(phrase => msg.includes(phrase))) {
+        console.log(`[CHAT] Ignoring system message`);
+        return;
+    }
+    
+    console.log(`[CHAT] <${user}> ${msg}`);
+    console.log('--- CHAIN START ---');
+
+    if (msg.startsWith('!role ')) {
+        try {
+            currentRole = getRole(msg.split(' ')[1]);
+            bot.chat(`Switched to ${currentRole.config.name}!`);
+        } catch (e) {
+            bot.chat(e.message);
+        }
+        console.log('--- CHAIN END ---');
+        return;
+    }
 
     bot.chat("Thinking...");
-    console.log(`[AI] Processing request from ${user}...`);
-
     conversationHistory.push({ role: "user", content: `Player ${user}: "${msg}"` });
-    while (conversationHistory.length > MAX_HISTORY) conversationHistory.shift();
+    
+    while (conversationHistory.length > MAX_HISTORY * 2) conversationHistory.shift();
 
-    try {
-        const response = await client.chat.completions.create({
-            model: config.ai.model,
-            messages: [
-                { role: "system", content: getSystemPrompt(bot) },
-                ...conversationHistory
-            ],
-            tools: tools,
-            tool_choice: "auto",
-            temperature: config.ai.temperature
-        });
+    let shouldContinue = true;
+    let iterations = 0;
+    const MAX_ITERATIONS = 5;
 
-        console.log(`[AI] Generation complete. Tokens: ${response.usage?.total_tokens}`);
+    while (shouldContinue && iterations < MAX_ITERATIONS) {
+        iterations++;
+        shouldContinue = false;
 
-        const message = response.choices[0].message;
-        
-        if (message.content) {
-            conversationHistory.push({ role: "assistant", content: message.content });
-        } else if (message.tool_calls) {
-            const toolNames = message.tool_calls.map(t => t.function.name).join(', ');
-            conversationHistory.push({ role: "assistant", content: `[Executed Tools: ${toolNames}]` });
-        }
-        while (conversationHistory.length > MAX_HISTORY) conversationHistory.shift();
+        try {
+            const response = await client.chat.completions.create({
+                model: currentRole.config.model || config.ai.model,
+                messages: [
+                    { role: "system", content: currentRole.getSystemPrompt(bot) },
+                    ...conversationHistory
+                ],
+                tools: currentRole.tools,
+                tool_choice: "auto",
+                temperature: currentRole.config.temperature || config.ai.temperature,
+                max_tokens: currentRole.config.max_tokens || config.ai.max_tokens,
+                top_p: currentRole.config.top_p || config.ai.top_p,
+                frequency_penalty: currentRole.config.frequency_penalty ?? config.ai.frequency_penalty,
+                presence_penalty: currentRole.config.presence_penalty ?? config.ai.presence_penalty,
+                stop: currentRole.config.stop || config.ai.stop
+            });
 
-        if (message.tool_calls) {
-            console.log(`[AI] Tool Calls: ${message.tool_calls.length}`);
-            for (const call of message.tool_calls) {
-                try {
-                    const args = JSON.parse(call.function.arguments);
-                    console.log(`[AI] Calling tool: ${call.function.name}`);
-                    await handleToolCall(bot, call.function.name, args, user);
-                } catch (parseError) {
-                    console.error(`[AI] Failed to parse arguments for ${call.function.name}:`, parseError);
-                }
+            const message = response.choices[0].message;
+
+            if (message.content) {
+                console.log(`[BOT] > ${message.content}`);
+                conversationHistory.push({ role: "assistant", content: message.content });
+                bot.chat(message.content);
             }
-        } else {
-            console.log(`[AI] Response: ${message.content}`);
-            bot.chat(message.content);
-        }
 
-    } catch (e) {
-        console.error("[AI] Critical Error:", e);
-        bot.chat("My brain hurts.");
+            if (message.tool_calls && message.tool_calls.length > 0) {
+                console.log(`[AI] Tools: ${message.tool_calls.map(t => t.function.name).join(', ')}`);
+                conversationHistory.push(message);
+
+                await executeTools(bot, message.tool_calls, currentRole.actions, user);
+
+                for (const toolCall of message.tool_calls) {
+                    conversationHistory.push({
+                        role: "tool",
+                        tool_call_id: toolCall.id,
+                        content: "Action completed successfully."
+                    });
+                }
+                
+                shouldContinue = true;
+            }
+
+        } catch (e) {
+            console.error("[AI] Error:", e);
+            bot.chat("Error occurred.");
+            shouldContinue = false;
+        }
     }
+    console.log('--- CHAIN END ---');
 });
 
-bot.on('kicked', (reason) => console.log('Kicked:', reason));
-bot.on('error', (err) => console.log('Bot Error:', err.message));
+bot.on('kicked', (reason) => console.log('[BOT] Kicked:', reason));
+bot.on('error', (err) => console.log('[BOT] Error:', err.message));
